@@ -8,3 +8,6 @@ wheels/
 
 # Virtual environments
 .venv
+
+# Session cache
+scheduler_agent/.adk/*

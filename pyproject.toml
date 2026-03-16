@@ -6,4 +6,6 @@ readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "google-adk>=1.27.0",
+    "google-cloud-monitoring>=2.29.1",
+    "google-cloud-run>=0.15.0",
 ]
