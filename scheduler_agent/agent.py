@@ -1,90 +1,101 @@
 import datetime
 import time
 import os
+import asyncio
 
 from google.adk.agents import LlmAgent
-from google.cloud import monitoring_v3
+from google.cloud.monitoring_v3 import MetricServiceAsyncClient, TimeInterval, Aggregation
 from google.cloud import run_v2
 from google.api_core import exceptions
 from google.adk import agents
 from google.adk.tools.preload_memory_tool import PreloadMemoryTool
 
+from scheduler_agent._prompts import SYSTEM_INSTRUCTION
+
 # --- Defining Tools ---
 
-def get_cloud_run_metrics(service_name: str, metric_type: str) -> dict:
+async def get_cloud_run_metrics(service_name: str) -> dict:
     """
-    Fetches real-time metrics from Google Cloud Monitoring.
-    Supported types: 'memory_utilization', 'request_count'.
+    Expert Tool: Fetches CPU, Memory, and Requests in parallel.
+    Includes robust error handling for API timeouts or permission issues.
     """
-    try:
-        client = monitoring_v3.MetricServiceClient()
-        project_id = os.environ.get("PROJECT_ID", None)
-        project_name = f"projects/{project_id}"
+    client = MetricServiceAsyncClient()
+    project_id = os.environ.get("PROJECT_ID", None)
+    project_name = f"projects/{project_id}"
 
-        metric_map = {
-            "request_count": "run.googleapis.com/request_count",
-            "memory_utilization": "run.googleapis.com/container/memory/utilization",
+    now = time.time()
+    interval = TimeInterval(mapping={
+        "end_time": {"seconds": int(now)},
+        "start_time": {"seconds": int(now - 300)},
         }
+    )
 
-        gcp_metric = metric_map.get(metric_type, metric_type)
+    metrics = {
+        "cpu": "run.googleapis.com/container/cpu/utilization",
+        "memory": "run.googleapis.com/container/memory/utilization",
+        "requests": "run.googleapis.com/request_count"
+    }
 
-        # Define the time interval (last 5 mins)
-        now = time.time()
-        interval = monitoring_v3.TimeInterval(mapping={
-            "end_time": {"seconds": int(now)},
-            "start_time": {"seconds": int(now - 300)},
-            }
-        )
-
+    async def fetch_one(m_type, m_path):
         filter_str = (
             f'resource.type = "cloud_run_revision" AND '
             f'resource.labels.service_name = "{service_name}" AND '
-            f'metric.type = "{gcp_metric}"'
+            f'metric.type = "{m_path}"'
         )
 
-        # Define the aggregation object
-        aggregation = monitoring_v3.Aggregation({
-            "alignment_period": {"seconds": 300},
-            "per_series_aligner": monitoring_v3.Aggregation.Aligner.ALIGN_MEAN,
+        aligner = Aggregation.Aligner.ALIGN_SUM if m_type == "requests" else Aggregation.Aligner.ALIGN_MEAN
+        
+        results = await client.list_time_series(request={
+            "name": project_name,
+            "filter": filter_str,
+            "interval": interval,
+            "aggregation": Aggregation({"alignment_period": {"seconds": 300}, "per_series_aligner": aligner}),
         })
 
-        results = client.list_time_series(
-            request={
-                "name": project_name,
-                "filter": filter_str,
-                "interval": interval,
-                "aggregation": aggregation, # Pass it inside the request dictionary
-            }
-        )
-
-        # Parse results
-        points = list()
-        for r in results:
-            for p in r.points:
-                val = p.value.double_value if "utilization" in gcp_metric else point.value.int64_value
-                points.append(val)
+        try:
+            pints = []
+            async for page in results:
+                for point in page.points:
+                    val = point.value.double_value if "utilization" in m_path else point.value.int64_value
+                    points.append(val)
+            
+            avg_val = round(sum(points) / len(points), 4) if points else 0.0
+            return m_type, avg_val
+        except Exception as e:
+            return m_type, f"Error: {str(e)}"
         
-        if not points:
-            return {"status": "no_data", "value": 0.0, "message": f"No data found for {service_name} in the last 5m."}
+    try:
 
-        avg_val = sum(points) / len(points)
-        print(f"\n[REAL-TIME OBSERVATION] {metric_type} for {service_name}: {avg_val:.2f}")
-        
+        tasks = [fetch_one(k, v) for k, v in metrics.items()]
+        results = await asyncio.gather(*tasks)
+
+        # Process results and identify if any specific metric failed
+        metrics_summary = {}
+        errors = []
+
+        for res in results:
+            if isinstance(res, Exception):
+                errors.append(f"System Error: {str(res)}")
+                continue
+            
+            m, v = res
+            if isinstance(value, str) and value.startswith("Error"):
+                errors.append(f"{m}: {v}")
+            else:
+                metrics_summary[m]=v
+
         return {
+            "status": "partial_success" if errors and metrics_summary else "success" if not errors else "error",
             "service": service_name,
-            "metric": metric_type,
-            "value": round(avg_val, 3),
-            "status": "success"
+            "data": metrics_summary,
+            "errors": errors if errors else None
         }
-    
-    except exceptions.PermissionDenied:
-        return {"status": "error", "message": "IAM Permission Denied. Check monitoring.viewer role."}
-    except exceptions.InvalidArgument as e:
-        return {"status": "error", "message": f"Invalid Filter or Project ID: {str(e)}"}
+    except exceptions.Unauthenticated:
+        # This stops the tool and tells the LLM EXACTLY what happened
+        raise RuntimeError("TERMINAL_AUTH_ERROR: Re-authentication required.")
     except Exception as e:
-        print(f"DEBUG: Unexpected error in get_cloud_run_metrics: {e}")
-        return {"status": "error", "message": f"An unexpected error occurred: {str(e)}"}
-
+        return {"status": "error", "message": str(e)}
+    
 
 def get_cloud_run_config(service_name: str, region: str = "us-central1") -> dict:
     """
@@ -122,6 +133,11 @@ def get_cloud_run_config(service_name: str, region: str = "us-central1") -> dict
 
     except exceptions.NotFound:
         return {"status": "error", "message": f"Service '{service_name}' not found in {region}."}
+    except exceptions.Unauthenticated:
+        return {
+            "status": "error", 
+            "message": "AUTH_FAILED: Your GCP credentials have expired. Run 'gcloud auth application-default login'."
+        }
     except Exception as e:
         return {"status": "error", "message": f"Failed to fetch config: {str(e)}"}
 
@@ -146,40 +162,6 @@ def patch_cloud_run_config(service_name: str, min_instances: int, max_concurrenc
 def get_current_system_time() -> str:
     """Returns the current system time for context."""
     return time.strftime("%Y-%m-%d %H:%M:%S %Z")
-
-# --- 5. SYSTEM INSTRUCTIONS (OPTION A: LEFT-ALIGNED) ---
-SYSTEM_INSTRUCTION = """ROLE:
-You are the CloudRun-Scheduler-Agent, a proactive SRE specialized in 
-predictive scaling and performance tuning for Google Cloud Run.
-You manage multiple microservices.
-You respond to both manual queries and automated Cloud Monitoring alerts.
-
-WORKFLOW:
-1. EXTRACTION: Identify the target service name from the user's request.
-2. ALWAYS check the current configuration using 'get_cloud_run_config'.
-3. ALWAYS check current health metrics using 'get_cloud_run_metrics'.
-4. ALWAYS check the current system time using 'get_current_system_time'.
-5. Compare the live state and metrics against the 'OPERATIONAL LOGIC' rules below.
-6. If the current state violates a rule or metrics show high risk, explain the risk and propose the fix.
-7. IAM CHECK: If a tool returns an 'error' status (e.g., Permission Denied), do not guess values. Stop and inform the user of the specific error.
-8. Only execute 'patch_cloud_run_config' after verification is complete.
-
-OPERATIONAL LOGIC & TUNING RULES:
-1. Never guess a service name; if ambiguous, ask the user for clarification.
-2. Memory Protection: Because of the 15MB payload, high concurrency leads to 
-   Out-of-Memory (OOM) crashes. Never set max_concurrency above 40 for this service.
-3. Reactive Memory Tuning: If 'memory_utilization' exceeds 0.80 (80%), immediately 
-   drop 'max_concurrency' to 20, regardless of current events, to stop OOM crashes.
-4. Predictive Scaling: When a 'Flash Deal' or 'Campaign' is detected, you must 
-   set min-instances to 20 BEFORE the event starts to eliminate cold starts.
-5. Flash Deal Tuning: During high-stress events, drop max_concurrency to 25 
-   to ensure each request has enough memory headroom.
-
-GUARDRAILS:
-- Maximum min-instances allowed: 80.
-- Minimum min-instances allowed: 10.
-- You must explain your reasoning (mentioning the 15MB payload risk and current metrics) 
-  before calling the patch_cloud_run_config tool."""
 
 # --- 6. AGENT CREATION ---
 def create_agent(memory_bank=None, session_service=None):
