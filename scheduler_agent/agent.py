@@ -37,8 +37,8 @@ async def get_cloud_run_metrics(service_name: str, project_id: str = None) -> di
     )
 
     metrics = {
-        "cpu": "run.googleapis.com/container/cpu/utilization",
-        "memory": "run.googleapis.com/container/memory/utilization",
+        "cpu": "run.googleapis.com/container/cpu/utilizations",
+        "memory": "run.googleapis.com/container/memory/utilizations",
         "requests": "run.googleapis.com/request_count"
     }
 
@@ -49,17 +49,24 @@ async def get_cloud_run_metrics(service_name: str, project_id: str = None) -> di
             f'metric.type = "{m_path}"'
         )
 
-        aligner = Aggregation.Aligner.ALIGN_SUM if m_type == "requests" else Aggregation.Aligner.ALIGN_MEAN
+        # aligner = Aggregation.Aligner.ALIGN_SUM if m_type == "requests" else Aggregation.Aligner.ALIGN_MEAN
+
+        aggregation = Aggregation({
+            "alignment_period": {"seconds": 60},
+            "per_series_aligner": Aggregation.Aligner.ALIGN_DELTA,
+            "cross_series_reducer": Aggregation.Reducer.REDUCE_MEAN,
+            "group_by_fields": ["resource.label.service_name"],
+        })
         
         results = await client.list_time_series(request={
             "name": project_name,
             "filter": filter_str,
             "interval": interval,
-            "aggregation": Aggregation({"alignment_period": {"seconds": 300}, "per_series_aligner": aligner}),
+            "aggregation": aggregation,
         })
 
         try:
-            pints = []
+            points = []
             async for page in results:
                 for point in page.points:
                     val = point.value.double_value if "utilization" in m_path else point.value.int64_value
@@ -85,7 +92,7 @@ async def get_cloud_run_metrics(service_name: str, project_id: str = None) -> di
                 continue
             
             m, v = res
-            if isinstance(value, str) and value.startswith("Error"):
+            if isinstance(v, str) and v.startswith("Error"):
                 errors.append(f"{m}: {v}")
             else:
                 metrics_summary[m]=v
@@ -111,7 +118,7 @@ def get_cloud_run_config(service_name: str, project_id: str = None, region: str 
     try:
         client = run_v2.ServicesClient()
         project_id = project_id or os.environ.get("PROJECT_ID", None)
-        region = region or os.environ.get("CLOUD_RUN_REGION") or "us-central1"
+        region = region or os.environ.get("CLOUD_RUN_REGION") or "europe-west1"
 
         if not project_id:
             return {
