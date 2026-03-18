@@ -14,13 +14,19 @@ from scheduler_agent._prompts import SYSTEM_INSTRUCTION
 
 # --- Defining Tools ---
 
-async def get_cloud_run_metrics(service_name: str) -> dict:
+async def get_cloud_run_metrics(service_name: str, project_id: str = None) -> dict:
     """
     Expert Tool: Fetches CPU, Memory, and Requests in parallel.
     Includes robust error handling for API timeouts or permission issues.
     """
     client = MetricServiceAsyncClient()
-    project_id = os.environ.get("PROJECT_ID", None)
+    project_id = project_id or os.environ.get("PROJECT_ID", None)
+    if not project_id:
+        return {
+            "status": "error",
+            "message": "CRITICAL: No Project ID provided and Project ID not found in the env. I cannot access Google Cloud to verify egress-test."
+        }
+
     project_name = f"projects/{project_id}"
 
     now = time.time()
@@ -67,7 +73,7 @@ async def get_cloud_run_metrics(service_name: str) -> dict:
     try:
 
         tasks = [fetch_one(k, v) for k, v in metrics.items()]
-        results = await asyncio.gather(*tasks)
+        results = await asyncio.gather(*tasks, return_exceptions=True)
 
         # Process results and identify if any specific metric failed
         metrics_summary = {}
@@ -97,15 +103,23 @@ async def get_cloud_run_metrics(service_name: str) -> dict:
         return {"status": "error", "message": str(e)}
     
 
-def get_cloud_run_config(service_name: str, region: str = "us-central1") -> dict:
+def get_cloud_run_config(service_name: str, project_id: str = None, region: str = None) -> dict:
     """
     Retrieves the live configuration of a Cloud Run service (v2).
     Returns: min_instances, max_concurrency, and memory limits.
     """
     try:
         client = run_v2.ServicesClient()
-        project_id = os.environ.get("PROJECT_ID", None)
-        
+        project_id = project_id or os.environ.get("PROJECT_ID", None)
+        region = region or os.environ.get("CLOUD_RUN_REGION") or "us-central1"
+
+        if not project_id:
+            return {
+                "status": "missing_info",
+                "parameter": "project_id",
+                "message": "I need a Project ID to access the service configuration."
+            }
+            
         # The fully qualified name: projects/{project}/locations/{location}/services/{service}
         resource_name = f"projects/{project_id}/locations/{region}/services/{service_name}"
         
@@ -172,8 +186,8 @@ def create_agent(memory_bank=None, session_service=None):
         tools=[
             get_cloud_run_config, 
             get_cloud_run_metrics, 
-            patch_cloud_run_config, 
-            get_current_system_time,
+            # patch_cloud_run_config, 
+            # get_current_system_time,
             PreloadMemoryTool()
         ]
         # REMOVE memory_bank and session_service from here 
